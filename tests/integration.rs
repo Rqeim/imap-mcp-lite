@@ -1,58 +1,29 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use http_body_util::BodyExt;
-use imap_mcp::providers::ProviderList;
-use imap_mcp::{build_router, session::SessionStore, AppState};
-use openidconnect::core::{
-    CoreClient, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType,
-    CoreSubjectIdentifierType,
-};
-use openidconnect::{
-    AuthUrl, ClientId, ClientSecret, IssuerUrl, JsonWebKeySetUrl, RedirectUrl, ResponseTypes,
-    TokenUrl,
-};
+use imap_mcp_lite::session::{SessionStore, StaticAccount};
+use imap_mcp_lite::{build_router, AppState};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-/// Build a fake OIDC client for testing (no real provider needed).
-fn fake_oidc_client() -> CoreClient {
-    let provider_metadata = CoreProviderMetadata::new(
-        IssuerUrl::new("https://gitlab.example.com".to_string()).unwrap(),
-        AuthUrl::new("https://gitlab.example.com/oauth/authorize".to_string()).unwrap(),
-        JsonWebKeySetUrl::new("https://gitlab.example.com/oauth/discovery/keys".to_string())
-            .unwrap(),
-        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
-        vec![CoreSubjectIdentifierType::Public],
-        vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
-        Default::default(),
-    )
-    .set_token_endpoint(Some(
-        TokenUrl::new("https://gitlab.example.com/oauth/token".to_string()).unwrap(),
-    ));
-
-    CoreClient::from_provider_metadata(
-        provider_metadata,
-        ClientId::new("test_client_id".to_string()),
-        Some(ClientSecret::new("test_client_secret".to_string())),
-    )
-    .set_redirect_uri(
-        RedirectUrl::new("https://imap-mcp.example.com/auth/callback".to_string()).unwrap(),
-    )
-}
-
-/// Build a test AppState with a fake OIDC client and dummy Redis URL.
+/// Build a test `AppState` with a static account, dummy Redis URL (no
+/// connection is opened at construction time) and a known bearer token.
 fn test_state() -> Arc<AppState> {
-    let encryption_key = B64.encode([0xABu8; 32]);
-    let sessions = SessionStore::new("redis://localhost:6379", &encryption_key).unwrap();
-    let providers = ProviderList::factorial_default("imap.example.com", 993).unwrap();
+    let sessions = SessionStore::new("redis://localhost:6379", "imap-mcp-lite:").unwrap();
+    let account = StaticAccount {
+        account_id: "static".to_string(),
+        label: "Test".to_string(),
+        imap_email: "user@example.com".to_string(),
+        imap_host: "imap.example.com".to_string(),
+        imap_port: 993,
+        password: "app-password".into(),
+    };
     Arc::new(
         AppState::new(
             sessions,
-            fake_oidc_client(),
-            providers,
-            "https://imap-mcp.example.com".to_string(),
+            account,
+            "https://imap-mcp-lite.example.com".to_string(),
+            "test-token".into(),
         )
         .unwrap(),
     )
@@ -70,83 +41,24 @@ async fn body_string(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-// --- OAuth well-known endpoint tests ---
+// --- Health endpoint ---
 
 #[tokio::test]
-async fn well_known_oauth_protected_resource_returns_correct_json() {
+async fn healthz_returns_ok() {
     let req = Request::builder()
-        .uri("/.well-known/oauth-protected-resource")
+        .uri("/healthz")
         .body(Body::empty())
         .unwrap();
-
     let resp = send_request(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
-
     let body = body_string(resp).await;
-    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["resource"], "https://imap-mcp.example.com");
-    assert!(json["authorization_servers"].is_array());
-    assert_eq!(
-        json["authorization_servers"][0],
-        "https://imap-mcp.example.com"
-    );
-    assert!(json["bearer_methods_supported"].is_array());
-}
-
-#[tokio::test]
-async fn well_known_oauth_authorization_server_returns_correct_json() {
-    let req = Request::builder()
-        .uri("/.well-known/oauth-authorization-server")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body = body_string(resp).await;
-    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["issuer"], "https://imap-mcp.example.com");
-    assert_eq!(
-        json["authorization_endpoint"],
-        "https://imap-mcp.example.com/auth/login"
-    );
-    assert_eq!(
-        json["token_endpoint"],
-        "https://imap-mcp.example.com/auth/token"
-    );
-    assert_eq!(
-        json["registration_endpoint"],
-        "https://imap-mcp.example.com/register"
-    );
-    assert!(json["response_types_supported"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("code")));
-    assert!(json["code_challenge_methods_supported"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("S256")));
-}
-
-// --- Dynamic client registration tests ---
-
-#[tokio::test]
-async fn register_without_redirect_uris_returns_error() {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/register")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"redirect_uris": []}"#))
-        .unwrap();
-
-    let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(body.contains("ok"));
 }
 
 // --- MCP endpoint auth tests ---
 
 #[tokio::test]
-async fn mcp_without_bearer_returns_401_with_www_authenticate() {
+async fn mcp_without_bearer_returns_401() {
     let req = Request::builder().uri("/mcp").body(Body::empty()).unwrap();
 
     let resp = send_request(req).await;
@@ -158,14 +70,7 @@ async fn mcp_without_bearer_returns_401_with_www_authenticate() {
         .expect("should have WWW-Authenticate header")
         .to_str()
         .unwrap();
-    assert!(
-        www_auth.contains("resource_metadata="),
-        "WWW-Authenticate should contain resource_metadata"
-    );
-    assert!(
-        www_auth.contains("/.well-known/oauth-protected-resource"),
-        "WWW-Authenticate should point to oauth-protected-resource"
-    );
+    assert!(www_auth.contains("Bearer"));
 
     let body = body_string(resp).await;
     assert_eq!(body, "Bearer token required");
@@ -183,7 +88,20 @@ async fn mcp_with_invalid_bearer_returns_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let body = body_string(resp).await;
-    assert_eq!(body, "Invalid or expired token");
+    assert_eq!(body, "Invalid token");
+}
+
+#[tokio::test]
+async fn mcp_with_prefix_bearer_returns_401() {
+    // A prefix of the real token must not authenticate.
+    let req = Request::builder()
+        .uri("/mcp")
+        .header("authorization", "Bearer test")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -212,55 +130,78 @@ async fn mcp_subpath_without_bearer_returns_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// --- Auth endpoint tests ---
-
 #[tokio::test]
-async fn auth_login_without_params_returns_error() {
+async fn mcp_with_valid_bearer_reaches_transport() {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        }
+    });
     let req = Request::builder()
-        .uri("/auth/login")
-        .body(Body::empty())
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "imap-mcp-lite.example.com")
+        .header("authorization", "Bearer test-token")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(payload.to_string()))
         .unwrap();
 
     let resp = send_request(req).await;
-    // Missing required query params → 422
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "Expected 400 or 422, got {status}"
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid token must not be rejected"
     );
 }
 
+// --- Removed OIDC / management routes ---
+
 #[tokio::test]
-async fn auth_setup_rejects_get_method() {
+async fn removed_oidc_and_manage_routes_are_gone() {
+    for uri in [
+        "/register",
+        "/auth/login",
+        "/auth/callback",
+        "/auth/token",
+        "/manage",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+    ] {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = send_request(req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "expected {uri} to be removed"
+        );
+    }
+}
+
+// --- Download endpoint ---
+
+#[tokio::test]
+async fn download_with_malformed_token_returns_404() {
     let req = Request::builder()
-        .method("GET")
-        .uri("/auth/setup")
+        .uri("/download/abc!def")
         .body(Body::empty())
         .unwrap();
-
     let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn auth_token_rejects_get_method() {
+async fn download_with_overlong_token_returns_404() {
+    let long = "a".repeat(65);
     let req = Request::builder()
-        .method("GET")
-        .uri("/auth/token")
+        .uri(format!("/download/{long}"))
         .body(Body::empty())
         .unwrap();
-
-    let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-}
-
-#[tokio::test]
-async fn nonexistent_route_returns_404() {
-    let req = Request::builder()
-        .uri("/nonexistent")
-        .body(Body::empty())
-        .unwrap();
-
     let resp = send_request(req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -270,7 +211,7 @@ async fn nonexistent_route_returns_404() {
 #[test]
 fn list_emails_params_defaults() {
     let json = r#"{}"#;
-    let params: imap_mcp::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.folder, "INBOX");
     assert_eq!(params.limit, 20);
     assert_eq!(params.offset, 0);
@@ -279,7 +220,7 @@ fn list_emails_params_defaults() {
 #[test]
 fn list_emails_params_custom() {
     let json = r#"{"folder": "Sent", "limit": 50, "offset": 10}"#;
-    let params: imap_mcp::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.folder, "Sent");
     assert_eq!(params.limit, 50);
     assert_eq!(params.offset, 10);
@@ -288,7 +229,7 @@ fn list_emails_params_custom() {
 #[test]
 fn get_email_params_with_defaults() {
     let json = r#"{"uid": 42}"#;
-    let params: imap_mcp::mcp::GetEmailParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::GetEmailParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.uid, 42);
     assert_eq!(params.folder, "INBOX");
 }
@@ -296,7 +237,7 @@ fn get_email_params_with_defaults() {
 #[test]
 fn search_emails_params_defaults() {
     let json = r#"{"query": "UNSEEN"}"#;
-    let params: imap_mcp::mcp::SearchEmailsParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::SearchEmailsParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.query, "UNSEEN");
     assert_eq!(params.folder, "INBOX");
     assert_eq!(params.limit, 20);
@@ -305,85 +246,15 @@ fn search_emails_params_defaults() {
 #[test]
 fn mark_params_with_defaults() {
     let json = r#"{"uid": 99}"#;
-    let params: imap_mcp::mcp::MarkParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::MarkParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.uid, 99);
     assert_eq!(params.folder, "INBOX");
 }
 
 #[test]
-fn mark_params_custom_folder() {
-    let json = r#"{"uid": 1, "folder": "Archive"}"#;
-    let params: imap_mcp::mcp::MarkParams = serde_json::from_str(json).unwrap();
-    assert_eq!(params.uid, 1);
-    assert_eq!(params.folder, "Archive");
-}
-
-#[test]
-fn list_emails_params_accepts_account() {
+fn list_emails_params_accepts_account_for_compatibility() {
     let json = r#"{"account": "billing"}"#;
-    let params: imap_mcp::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
+    let params: imap_mcp_lite::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.account.as_deref(), Some("billing"));
     assert_eq!(params.folder, "INBOX");
-}
-
-// --- /manage route tests ---
-
-#[tokio::test]
-async fn manage_without_ticket_or_cookie_redirects_to_oidc() {
-    let req = Request::builder()
-        .uri("/manage")
-        .body(Body::empty())
-        .unwrap();
-    let resp = send_request(req).await;
-    // Temporary redirect to /auth/manage_login (no cookie, no ticket).
-    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-    let location = resp
-        .headers()
-        .get("location")
-        .expect("redirect should have location")
-        .to_str()
-        .unwrap();
-    assert!(
-        location.ends_with("/auth/manage_login"),
-        "expected /auth/manage_login, got {location}"
-    );
-}
-
-#[tokio::test]
-async fn manage_add_account_without_cookie_returns_401() {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/manage/accounts")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(
-            "csrf_token=x&provider_id=factorial&label=L&imap_email=a@b&imap_password=p",
-        ))
-        .unwrap();
-    let resp = send_request(req).await;
-    // AppError::Auth(...) maps to 401 in error.rs.
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn manage_delete_account_without_cookie_returns_401() {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/manage/accounts/some-id/delete")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from("csrf_token=x"))
-        .unwrap();
-    let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn manage_set_default_without_cookie_returns_401() {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/manage/accounts/some-id/set_default")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from("csrf_token=x"))
-        .unwrap();
-    let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

@@ -1,31 +1,22 @@
+# Local development helper: runs the server with an ngrok tunnel so an MCP
+# client can reach it over HTTPS. Redis is NOT started here — set REDIS_URL in
+# .env to a reachable central instance.
 services:
-  imap-mcp:
+  imap-mcp-lite:
     build: .
     restart: unless-stopped
     environment:
-      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL}
-      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
-      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
-      - IMAP_HOST=${IMAP_HOST}
+      - AUTH_MODE=static
+      - MCP_API_TOKEN=${MCP_API_TOKEN}
+      - IMAP_HOST=${IMAP_HOST:-mail.privateemail.com}
       - IMAP_PORT=${IMAP_PORT:-993}
+      - IMAP_USERNAME=${IMAP_USERNAME}
+      - IMAP_APP_PASSWORD=${IMAP_APP_PASSWORD}
       - BASE_URL=${BASE_URL}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL}
+      - REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX:-imap-mcp-lite:}
       - BIND_ADDR=0.0.0.0:8080
       - RUST_LOG=debug
-    depends_on:
-      - redis
-    networks:
-      - internal
-
-  redis:
-    image: redis:8-alpine
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
     networks:
       - internal
 
@@ -37,15 +28,12 @@ services:
     # Free tier: random URL (check logs for the public URL)
     # Reserved domain: uncomment and set NGROK_DOMAIN in .env
     command: >
-      http imap-mcp:8080
+      http imap-mcp-lite:8080
       ${NGROK_DOMAIN:+--url=${NGROK_DOMAIN}}
     ports:
       - "4040:4040"
     networks:
       - internal
-
-volumes:
-  redis-data:
 
 networks:
   internal:

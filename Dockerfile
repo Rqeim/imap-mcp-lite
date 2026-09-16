@@ -7,18 +7,18 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-RUN cargo build --release && strip target/release/imap-mcp
+RUN cargo build --release && strip target/release/imap-mcp-lite
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
-LABEL org.opencontainers.image.source="https://github.com/factorial-io/imap-mcp"
+LABEL org.opencontainers.image.source="https://github.com/Rqeim/imap-mcp-lite"
 
 RUN apt-get update && apt-get install -y ca-certificates libssl3 antiword && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home appuser
 
-COPY --from=builder /app/target/release/imap-mcp /usr/local/bin/imap-mcp
+COPY --from=builder /app/target/release/imap-mcp-lite /usr/local/bin/imap-mcp-lite
 
 USER appuser
 EXPOSE 8080
 ENV RUST_LOG=info
-CMD ["imap-mcp"]
+CMD ["imap-mcp-lite"]

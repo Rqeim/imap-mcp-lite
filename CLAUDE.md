@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-Rust MCP server bridging claude.ai to IMAP email via OIDC auth.
+Rust Streamable HTTP MCP server bridging one statically configured IMAP
+mailbox to clients authenticated with a bearer token.
 
 ## Build & Test
 
@@ -23,14 +24,9 @@ Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propag
 
 - `src/main.rs` — entrypoint, Axum server setup
 - `src/lib.rs` — app config, shared state
-- `src/auth.rs` — OAuth/OIDC flow, dynamic client registration, token exchange
-- `src/mcp.rs` — MCP tool definitions (list_folders, list_emails, get_email, search_emails, mark_read, mark_unread)
+- `src/mcp.rs` — MCP tool definitions
 - `src/imap.rs` — IMAP client operations
-- `src/session.rs` — Redis session storage, encryption
+- `src/session.rs` — static account types and Redis download tickets
 - `src/error.rs` — error types
 - `src/extract.rs` — text extraction for attachments (PDF, DOCX, XLSX, PPTX)
 - `tests/integration.rs` — integration tests
-
-## Recent Changes
-
-- 001-limit-attachment-size: Added attachment size limiting and text extraction

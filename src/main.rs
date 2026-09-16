@@ -1,49 +1,54 @@
 use clap::Parser;
-use imap_mcp::{auth, build_router, providers::ProviderList, session::SessionStore, AppState};
+use imap_mcp_lite::{
+    build_router,
+    session::{SessionStore, StaticAccount},
+    AppState,
+};
 use std::sync::Arc;
 
-/// Server configuration. Most fields are sourced from environment variables;
-/// `--imap-providers` is a CLI override that wins over the `IMAP_PROVIDERS`
-/// env var.
-#[derive(Parser, Debug)]
-#[command(version, about = "IMAP MCP server", long_about = None)]
+/// Server configuration. Static mode only: a single IMAP account and a single
+/// bearer token, both supplied via environment variables.
+#[derive(Parser)]
+#[command(version, about = "IMAP MCP server (lite)", long_about = None)]
 struct Cli {
-    #[arg(long, env = "OIDC_ISSUER_URL")]
-    oidc_issuer_url: String,
+    /// Authentication mode. Only `static` is supported.
+    #[arg(long, env = "AUTH_MODE", default_value = "static")]
+    auth_mode: String,
 
-    #[arg(long, env = "OIDC_CLIENT_ID")]
-    oidc_client_id: String,
+    /// Bearer token required on `/mcp`. Never logged.
+    #[arg(long, env = "MCP_API_TOKEN")]
+    mcp_api_token: String,
 
-    #[arg(long, env = "OIDC_CLIENT_SECRET")]
-    oidc_client_secret: String,
-
-    /// Default IMAP host. Used as the sole entry of the provider allowlist
-    /// when neither --imap-providers nor IMAP_PROVIDERS is set, and as the
-    /// migration target for legacy single-account sessions.
-    #[arg(long, env = "IMAP_HOST")]
+    /// IMAP host for the static account.
+    #[arg(long, env = "IMAP_HOST", default_value = "mail.privateemail.com")]
     imap_host: String,
 
+    /// IMAP port for the static account.
     #[arg(long, env = "IMAP_PORT", default_value_t = 993)]
     imap_port: u16,
 
-    #[arg(long, env = "BASE_URL")]
+    /// IMAP login username (usually the full email address).
+    #[arg(long, env = "IMAP_USERNAME")]
+    imap_username: String,
+
+    /// IMAP app password. Never logged.
+    #[arg(long, env = "IMAP_APP_PASSWORD")]
+    imap_app_password: String,
+
+    /// Public URL of this service, no trailing slash.
+    #[arg(long, env = "BASE_URL", default_value = "http://localhost:8080")]
     base_url: String,
 
+    /// Central Redis connection URL (used for one-shot download tickets).
     #[arg(long, env = "REDIS_URL")]
     redis_url: String,
 
-    #[arg(long, env = "ENCRYPTION_KEY")]
-    encryption_key: String,
+    /// Prefix for every Redis key this app writes.
+    #[arg(long, env = "REDIS_KEY_PREFIX", default_value = "imap-mcp-lite:")]
+    redis_key_prefix: String,
 
     #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0:8080")]
     bind_addr: String,
-
-    /// IMAP provider allowlist. Either inline JSON (starting with `[`) or a
-    /// path to a JSON file. Wins over the `IMAP_PROVIDERS` env var.
-    /// When neither is set, the allowlist contains exactly one entry pointing
-    /// at `--imap-host` / `--imap-port`.
-    #[arg(long)]
-    imap_providers: Option<String>,
 }
 
 #[tokio::main]
@@ -56,41 +61,50 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Provider allowlist: --imap-providers (CLI) wins over IMAP_PROVIDERS (env);
-    // either may be inline JSON or a path. If neither is set, the default
-    // ships with a single entry pointing at IMAP_HOST/IMAP_PORT.
-    let providers = if let Some(raw) = cli.imap_providers.as_deref() {
-        ProviderList::parse_inline_or_path(raw)?
-    } else if let Ok(raw) = std::env::var("IMAP_PROVIDERS") {
-        ProviderList::parse_inline_or_path(&raw)?
-    } else {
-        ProviderList::factorial_default(&cli.imap_host, cli.imap_port)?
+    if cli.auth_mode != "static" {
+        anyhow::bail!(
+            "unsupported AUTH_MODE '{}': only 'static' is supported",
+            cli.auth_mode
+        );
+    }
+    // Trust-boundary validation: refuse to start with an empty bearer token
+    // (which would accept an empty credential) or missing IMAP credentials.
+    if cli.mcp_api_token.len() < 32 {
+        anyhow::bail!("MCP_API_TOKEN must be at least 32 characters");
+    }
+    if cli.imap_username.trim().is_empty() {
+        anyhow::bail!("IMAP_USERNAME must not be empty");
+    }
+    if cli.imap_app_password.is_empty() {
+        anyhow::bail!("IMAP_APP_PASSWORD must not be empty");
+    }
+    if cli.redis_key_prefix.trim().is_empty() {
+        anyhow::bail!("REDIS_KEY_PREFIX must not be empty");
+    }
+
+    let sessions = SessionStore::new(&cli.redis_url, &cli.redis_key_prefix)?;
+
+    let account = StaticAccount {
+        account_id: "static".to_string(),
+        label: cli.imap_username.clone(),
+        imap_email: cli.imap_username.clone(),
+        imap_host: cli.imap_host.clone(),
+        imap_port: cli.imap_port,
+        password: cli.imap_app_password.as_str().into(),
     };
 
     tracing::info!(
-        providers = ?providers.iter().map(|p| &p.id).collect::<Vec<_>>(),
-        "IMAP provider allowlist loaded"
+        imap_host = %cli.imap_host,
+        imap_port = cli.imap_port,
+        redis_key_prefix = %cli.redis_key_prefix,
+        "static IMAP account configured"
     );
-
-    let sessions = SessionStore::new(&cli.redis_url, &cli.encryption_key)?;
-
-    tracing::info!(
-        "Discovering OIDC configuration from {}",
-        cli.oidc_issuer_url
-    );
-    let oidc_client = auth::build_oidc_client(
-        &cli.oidc_issuer_url,
-        &cli.oidc_client_id,
-        &cli.oidc_client_secret,
-        &cli.base_url,
-    )
-    .await?;
 
     let state = Arc::new(AppState::new(
         sessions,
-        oidc_client,
-        providers,
-        cli.base_url,
+        account,
+        cli.base_url.clone(),
+        cli.mcp_api_token.as_str().into(),
     )?);
 
     let app = build_router(state);

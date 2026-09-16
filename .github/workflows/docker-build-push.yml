@@ -51,13 +51,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Trigger GitLab pipeline
-        if: success() && github.ref == 'refs/heads/main'
-        run: |
-          curl --fail -X POST \
-            "https://source.factorial.io/api/v4/projects/${{ secrets.GITLAB_PROJECT_ID }}/trigger/pipeline" \
-            -F "token=${{ secrets.GITLAB_TRIGGER_TOKEN }}" \
-            -F "ref=main"
-
       - name: Log out from GitHub Container Registry
         run: docker logout ghcr.io

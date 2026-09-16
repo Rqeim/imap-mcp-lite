@@ -10,11 +10,13 @@ use crate::imap::{
     self, AttachmentData, DraftContent, ExtractionHint, ImapConnection, MAX_LLM_CONTENT_SIZE,
     MAX_RAW_BYTES_SIZE,
 };
-use crate::manage::{AccountSummary, ListAccountsResult};
-use crate::session::{Account, DownloadTicket, DOWNLOAD_TICKET_TTL};
-use crate::{AccountResolver, ResolveError};
+use crate::session::{
+    AccountSummary, DownloadTicket, ListAccountsResult, StaticAccount, DOWNLOAD_TICKET_TTL,
+};
+use crate::AccountResolver;
+use secrecy::ExposeSecret;
 
-/// MCP server instance — one per request, holds session context.
+/// MCP server instance — one per request, holds the static account context.
 pub struct ImapMcpServer {
     resolver: AccountResolver,
 }
@@ -24,90 +26,36 @@ impl ImapMcpServer {
         Self { resolver }
     }
 
-    /// Resolve an account, connect, record success on login. The returned
-    /// connection has already passed IMAP login.
+    /// Connect to the configured static account. The `selector` parameter is
+    /// kept for wire compatibility with the multi-account tools but ignored:
+    /// this server always targets its single account. The returned connection
+    /// has already passed IMAP login.
     async fn connect_with(
         &self,
-        selector: Option<&str>,
-    ) -> Result<(Account, ImapConnection), rmcp::ErrorData> {
-        let account = self
-            .resolver
-            .resolve(selector)
-            .await
-            .map_err(resolve_to_rmcp)?;
-        let password = self
-            .resolver
-            .store
-            .decrypt_account_password(&account)
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("decrypt failed: {e}"), None))?;
-
+        _selector: Option<&str>,
+    ) -> Result<(StaticAccount, ImapConnection), rmcp::ErrorData> {
+        let account = self.resolver.account.as_ref().clone();
+        let password = account.password.expose_secret();
         match ImapConnection::connect(
             &account.imap_host,
             account.imap_port,
             &account.imap_email,
-            &password,
+            password,
         )
         .await
         {
             Ok(conn) => {
-                // Login succeeded — clear the failure counter and bump last_used_at.
-                if let Err(e) = self
-                    .resolver
-                    .store
-                    .record_account_success(&self.resolver.oidc_sub, &account.account_id)
-                    .await
-                {
-                    tracing::warn!("failed to record account success: {e}");
-                }
                 tracing::info!(
-                    oidc_sub = %self.resolver.oidc_sub,
                     account_id = %account.account_id,
-                    imap_email = %account.imap_email,
                     imap_host = %account.imap_host,
                     "IMAP login ok"
                 );
                 Ok((account, conn))
             }
-            Err(AppError::ImapAuth) => {
-                // Don't suppress Redis errors silently: log and proceed with
-                // `false` (we'll still surface a "login failed" error to the
-                // caller, just won't be able to mark the account auto-disabled
-                // until Redis recovers).
-                let just_disabled = match self
-                    .resolver
-                    .store
-                    .record_account_auth_failure(&self.resolver.oidc_sub, &account.account_id)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            oidc_sub = %self.resolver.oidc_sub,
-                            account_id = %account.account_id,
-                            error = %e,
-                            "failed to record auth failure"
-                        );
-                        false
-                    }
-                };
-                let manage_url = self
-                    .resolver
-                    .fresh_manage_url()
-                    .await
-                    .map_err(resolve_to_rmcp)?;
-                let msg = if just_disabled {
-                    format!(
-                        "IMAP login failed; account '{}' is now disabled after repeated failures. Re-validate at {manage_url}",
-                        account.label
-                    )
-                } else {
-                    format!(
-                        "IMAP login failed for account '{}'. If the password changed, re-validate at {manage_url}",
-                        account.label
-                    )
-                };
-                Err(rmcp::ErrorData::invalid_request(msg, None))
-            }
+            Err(AppError::ImapAuth) => Err(rmcp::ErrorData::invalid_request(
+                "IMAP login failed. Check IMAP_USERNAME / IMAP_APP_PASSWORD.",
+                None,
+            )),
             Err(e) => Err(rmcp::ErrorData::internal_error(
                 format!("IMAP connection failed: {e}"),
                 None,
@@ -116,55 +64,14 @@ impl ImapMcpServer {
     }
 }
 
-fn resolve_to_rmcp(err: ResolveError) -> rmcp::ErrorData {
-    match err {
-        ResolveError::NoAccounts { manage_url } => rmcp::ErrorData::invalid_request(
-            format!(
-                "No mailboxes connected. Open {manage_url} in your browser to add one."
-            ),
-            None,
-        ),
-        ResolveError::AccountRequired => rmcp::ErrorData::invalid_params(
-            "Multiple mailboxes are connected — pass `account` (account_id or label). Call list_accounts to see them.",
-            None,
-        ),
-        ResolveError::NotFound(s) => {
-            rmcp::ErrorData::invalid_params(format!("Account '{s}' not found."), None)
-        }
-        ResolveError::Ambiguous(s) => rmcp::ErrorData::invalid_params(
-            format!("Label '{s}' matches multiple accounts — pass account_id instead."),
-            None,
-        ),
-        ResolveError::Disabled { manage_url } => rmcp::ErrorData::invalid_request(
-            format!(
-                "Account is disabled (too many failed logins). Re-validate at {manage_url}"
-            ),
-            None,
-        ),
-        ResolveError::ProviderRemoved {
-            host,
-            port,
-            manage_url,
-        } => rmcp::ErrorData::invalid_request(
-            format!(
-                "This mailbox uses provider {host}:{port} which is no longer in the operator's allowlist. Remove the account and reconnect at {manage_url}"
-            ),
-            None,
-        ),
-        ResolveError::Internal(s) => rmcp::ErrorData::internal_error(s, None),
-    }
-}
-
 // --- Shared `account` parameter ---
 
-/// Optional `account` selector applied to every IMAP-touching tool. Accepts
-/// either an `account_id` (preferred, unambiguous) or a `label`. Required
-/// when the user has more than one connected mailbox.
+/// Optional `account` selector accepted by every IMAP-touching tool for wire
+/// compatibility. In static single-account mode it is ignored — the server
+/// always targets its one configured mailbox.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct AccountSelector {
-    /// Account id or label. If you have only one mailbox, leave this off.
-    /// If you have more than one, call list_accounts to see them and pass
-    /// the account_id of the one you want.
+    /// Kept for compatibility; ignored in static single-account mode.
     #[serde(default)]
     pub account: Option<String>,
 }
@@ -339,56 +246,19 @@ fn default_limit() -> u32 {
 #[tool_router]
 impl ImapMcpServer {
     #[tool(
-        description = "List the mailboxes (IMAP accounts) connected to this MCP server for the current user. Returns each account's id, label, IMAP login email, host, last-used time, disabled flag, and is_default flag, plus a short-lived signed manage_url the user can open in their browser to add, remove, or change the default. Tool calls that omit `account` resolve to the account marked is_default; pass `account` (account_id or label) to target a specific one."
+        description = "List the mailbox connected to this MCP server. This server runs in static single-account mode, so exactly one account is returned (its id, label, IMAP login email, and host). The account is always the default, and it cannot be added, removed, or changed at runtime."
     )]
     async fn list_accounts(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let accounts = self.resolver.list().await.map_err(resolve_to_rmcp)?;
-        let default_id = self
-            .resolver
-            .store
-            .get_default_account_id(&self.resolver.oidc_sub)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("default lookup: {e}"), None))?;
-        let manage_url = crate::manage::issue_manage_url(
-            &self.resolver.store,
-            &self.resolver.base_url,
-            &self.resolver.oidc_sub,
-            &self.resolver.oidc_email,
-        )
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
-
-        let summaries: Vec<AccountSummary> = accounts
-            .iter()
-            .map(|a| AccountSummary::from_account(a, default_id.as_deref()))
-            .collect();
+        let summary = AccountSummary::from_static(&self.resolver.account);
         let result = ListAccountsResult {
-            accounts: summaries,
-            manage_url,
+            accounts: vec![summary],
         };
         let json = Content::json(&result)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
 
-    #[tool(
-        description = "Return a fresh, short-lived (15 minute) signed URL the user can open in their browser to add a new mailbox to this MCP server. Use this when the user says something like 'connect my Gmail' or 'add my work email' — surface the URL to them. After they finish in the browser, call list_accounts to confirm."
-    )]
-    async fn add_account_url(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let manage_url = crate::manage::issue_manage_url(
-            &self.resolver.store,
-            &self.resolver.base_url,
-            &self.resolver.oidc_sub,
-            &self.resolver.oidc_email,
-        )
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
-        let json = Content::json(&manage_url)
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
-        Ok(CallToolResult::success(vec![json]))
-    }
-
-    #[tool(description = "List all IMAP mailbox folders for the selected account.")]
+    #[tool(description = "List all IMAP mailbox folders for the configured account.")]
     async fn list_folders(
         &self,
         Parameters(params): Parameters<AccountSelector>,
@@ -480,7 +350,7 @@ impl ImapMcpServer {
             filename: filename.clone(),
             mime_type: attachment.info.mime_type.clone(),
             size: attachment.info.size,
-            oidc_sub: self.resolver.oidc_sub.clone(),
+            account_id: self.resolver.account.account_id.clone(),
         };
         let token = self
             .resolver
@@ -823,7 +693,8 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. Tools: list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, download_attachment, create_draft, update_draft. When get_email returns attachment metadata, each attachment has an `extraction` field telling you what get_attachment will return: `text` (PDFs, Office docs, plain text — server extracts text, truncated to 200 KB); `embedded_message` (the attachment is itself an email — server parses it natively and returns headers, body, and its own attachments); `image` (returned visually if small enough); `raw_bytes` (returned as base64 for binary formats under 5 MB); `too_large` (call download_attachment instead). The `index` field is a path array: top-level attachments are like [0], an attachment inside a forwarded .eml is [0, 1], and so on up to 5 levels deep. Use the same array as `attachment_index` for get_attachment and download_attachment. download_attachment returns a one-shot signed URL valid for 15 minutes — surface it to the user as a clickable link; Claude cannot fetch it directly. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+                        "IMAP email server in static single-account mode. Exactly one mailbox is configured by the operator; list_accounts shows it, and there is no way to add or remove mailboxes at runtime. Every IMAP tool targets this account; an optional `account` selector is accepted for compatibility and ignored. Tools:
+ list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, download_attachment, create_draft, update_draft. When get_email returns attachment metadata, each attachment has an `extraction` field telling you what get_attachment will return: `text` (PDFs, Office docs, plain text — server extracts text, truncated to 200 KB); `embedded_message` (the attachment is itself an email — server parses it natively and returns headers, body, and its own attachments); `image` (returned visually if small enough); `raw_bytes` (returned as base64 for binary formats under 5 MB); `too_large` (call download_attachment instead). The `index` field is a path array: top-level attachments are like [0], an attachment inside a forwarded .eml is [0, 1], and so on up to 5 levels deep. Use the same array as `attachment_index` for get_attachment and download_attachment. download_attachment returns a one-shot signed URL valid for 15 minutes — surface it to the user as a clickable link; Claude cannot fetch it directly. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }
