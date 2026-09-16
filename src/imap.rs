@@ -254,12 +254,9 @@ impl ImapConnection {
         }
 
         // Calculate sequence range (IMAP sequences are 1-based, newest last)
-        let end = total.saturating_sub(offset);
-        if end == 0 {
+        let Some(range) = page_range(total, limit, offset) else {
             return Ok(Vec::new());
-        }
-        let start = end.saturating_sub(limit).max(1);
-        let range = format!("{start}:{end}");
+        };
 
         let fetches: Vec<async_imap::types::Fetch> = self
             .session
@@ -844,6 +841,23 @@ fn split_address_list(value: &str) -> Vec<String> {
     parts
 }
 
+/// Build the inclusive IMAP sequence range for the newest-first page
+/// `[offset, offset + limit)`. IMAP sequences are 1-based with the newest
+/// message last, so the page ends at `total - offset`. Returns `None` when
+/// the page is empty (offset past the end of the mailbox).
+///
+/// The range is inclusive on both ends, so `start` must be `end - limit + 1`
+/// to yield exactly `limit` messages (asking for `end - limit` returns one
+/// extra).
+fn page_range(total: u32, limit: u32, offset: u32) -> Option<String> {
+    let end = total.checked_sub(offset)?;
+    if end == 0 {
+        return None;
+    }
+    let start = end.saturating_sub(limit).saturating_add(1);
+    Some(format!("{start}:{end}"))
+}
+
 fn parse_summary(fetch: &async_imap::types::Fetch) -> EmailSummary {
     let envelope = fetch.envelope();
     let seen = fetch
@@ -1270,6 +1284,22 @@ mod tests {
     use super::*;
     use mailparse::MailHeaderMap;
     use std::borrow::Cow;
+
+    #[test]
+    fn page_range_returns_exactly_limit_messages() {
+        // 544 messages, newest page of 5 => the 5 newest are 540..=544.
+        assert_eq!(page_range(544, 5, 0).as_deref(), Some("540:544"));
+        assert_eq!(page_range(2, 5, 0).as_deref(), Some("1:2"));
+        assert_eq!(page_range(10, 5, 5).as_deref(), Some("1:5"));
+        assert_eq!(page_range(1, 20, 0).as_deref(), Some("1:1"));
+    }
+
+    #[test]
+    fn page_range_empty_when_offset_past_end() {
+        assert_eq!(page_range(10, 5, 10), None);
+        assert_eq!(page_range(10, 5, 11), None);
+        assert_eq!(page_range(0, 5, 0), None);
+    }
 
     #[test]
     fn decode_header_value_plain_ascii() {
